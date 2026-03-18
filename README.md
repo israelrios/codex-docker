@@ -8,9 +8,11 @@
 - Maps the current directory into the container at the same absolute path.
 - Maps `~/.codex` into the container at the same absolute path.
 - Maps each existing path listed in `sandbox_workspace_write.writable_roots` from `~/.codex/config.toml`.
-- Loads the exported variables from `~/.xsessionrc` into the container environment.
-- Maps directory paths referenced by those `~/.xsessionrc` variables when they exist on the host, excluding paths under `/usr` and `/var`.
+- Forwards the invoking shell environment into the container, excluding keys matched by `vars-to-ignore.txt`.
+- Forwards the invoking shell's current `PATH` and prepends it to the image `PATH`.
+- Maps directory paths referenced by those forwarded variables when they exist on the host, excluding paths under `/usr` and `/var`.
 - Reuses the host CA trust store by bind-mounting the host certificate paths read-only.
+- Uses Docker host network mode.
 - Runs the container with the invoking user UID and GID.
 - Starts `codex --dangerously-bypass-approvals-and-sandbox` automatically.
 

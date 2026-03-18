@@ -2,11 +2,14 @@
 
 import argparse
 import ast
+import fnmatch
+import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
@@ -15,6 +18,7 @@ DEFAULT_IMAGE = "codex-docker:latest"
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 BASE_PATH_SEGMENTS = set(BASE_PATH.split(":"))
 EXCLUDED_MOUNT_PREFIXES = ("/usr", "/var")
+PROFILE_SCRIPT_CONTAINER_PATH = "/etc/profile.d/codex-forwarded-path.sh"
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,50 +129,40 @@ def ordered_unique(values: Iterable[str]) -> list[str]:
     return result
 
 
-def parse_env_output(output: bytes) -> dict[str, str]:
+def split_path(value: str) -> list[str]:
+    return [segment for segment in value.split(":") if segment]
+
+
+def merge_path_values(preferred: str, fallback: str) -> str:
+    return ":".join(ordered_unique([*split_path(preferred), *split_path(fallback)]))
+
+
+def load_ignore_patterns(ignore_path: Path) -> list[str]:
+    if not ignore_path.is_file():
+        raise SystemExit(f"Missing ignore file: {ignore_path}")
+
+    patterns: list[str] = []
+    with ignore_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            patterns.append(line.split("=", 1)[0].strip())
+    return patterns
+
+
+def is_ignored_env_var(name: str, patterns: Iterable[str]) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+
+
+def filtered_shell_env(ignore_path: Path) -> dict[str, str]:
+    patterns = load_ignore_patterns(ignore_path)
     env_map: dict[str, str] = {}
-    for entry in output.split(b"\0"):
-        if not entry:
+    for key, value in os.environ.items():
+        if is_ignored_env_var(key, patterns):
             continue
-        key, value = entry.split(b"=", 1)
-        env_map[key.decode()] = value.decode()
+        env_map[key] = value
     return env_map
-
-
-def capture_shell_env(command: str, env: dict[str, str]) -> dict[str, str]:
-    completed = subprocess.run(
-        ["bash", "-lc", command],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise SystemExit(f"Failed to evaluate shell environment with command: {command}")
-    return parse_env_output(completed.stdout)
-
-
-def load_xsessionrc_env(home_dir: Path) -> dict[str, str]:
-    xsessionrc_path = home_dir / ".xsessionrc"
-    if not xsessionrc_path.is_file():
-        return {}
-
-    user_name = os.environ.get("USER") or home_dir.name
-    seed_env = {
-        "HOME": str(home_dir),
-        "LOGNAME": os.environ.get("LOGNAME") or user_name,
-        "PATH": BASE_PATH,
-        "SHELL": os.environ.get("SHELL") or "/bin/bash",
-        "USER": user_name,
-    }
-    before = capture_shell_env("env -0", seed_env)
-    after = capture_shell_env('source "$HOME/.xsessionrc" >/dev/null 2>&1; env -0', seed_env)
-
-    exports: dict[str, str] = {}
-    for key, value in after.items():
-        if before.get(key) != value:
-            exports[key] = value
-    return exports
 
 
 def shell_pwd() -> Path:
@@ -194,6 +188,31 @@ def docker_env_flags(names: Iterable[str]) -> list[str]:
     for name in ordered_unique(names):
         flags.extend(["--env", name])
     return flags
+
+
+def image_env(image: str) -> dict[str, str]:
+    completed = subprocess.run(
+        ["docker", "image", "inspect", image, "--format", "{{json .Config.Env}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return {}
+
+    try:
+        env_entries = json.loads(completed.stdout.strip() or "[]")
+    except json.JSONDecodeError:
+        return {}
+
+    result: dict[str, str] = {}
+    for entry in env_entries:
+        if "=" not in entry:
+            continue
+        key, value = entry.split("=", 1)
+        result[key] = value
+    return result
 
 
 def ensure_image(script_dir: Path, image: str, rebuild: bool, skip_build: bool) -> None:
@@ -241,6 +260,23 @@ def env_directory_refs(env_map: dict[str, str]) -> list[str]:
             if path.is_dir() and not path_str.startswith(EXCLUDED_MOUNT_PREFIXES):
                 refs.append(str(path))
     return ordered_unique(refs)
+
+
+def write_path_profile(script_path: Path, forwarded_path: str) -> None:
+    lines = ["#!/bin/sh"]
+    for segment in reversed(split_path(forwarded_path)):
+        quoted_segment = shlex.quote(segment)
+        lines.extend(
+            [
+                f"_codex_path={quoted_segment}",
+                'case ":$PATH:" in',
+                '  *":${_codex_path}:"*) ;;',
+                '  *) PATH="${_codex_path}${PATH:+:$PATH}" ;;',
+                "esac",
+            ]
+        )
+    lines.extend(["export PATH", "unset _codex_path"])
+    script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def host_ca_setup() -> tuple[dict[str, str], list[str]]:
@@ -310,6 +346,7 @@ def main() -> None:
     home_dir = Path.home()
     codex_dir = home_dir / ".codex"
     config_path = codex_dir / "config.toml"
+    ignore_path = script_dir / "vars-to-ignore.txt"
     cwd = shell_pwd()
 
     if not config_path.is_file():
@@ -319,7 +356,10 @@ def main() -> None:
     if not codex_dir.is_dir():
         raise SystemExit(f"Missing Codex directory: {codex_dir}")
 
-    xsessionrc_env = load_xsessionrc_env(home_dir)
+    if not args.dry_run:
+        ensure_image(script_dir, args.image, args.rebuild, args.skip_build)
+
+    shell_env = filtered_shell_env(ignore_path)
     writable_roots = parse_writable_roots(config_path)
     existing_roots: list[str] = []
     missing_roots: list[str] = []
@@ -339,25 +379,26 @@ def main() -> None:
         for root in missing_roots:
             print(f"  - {root}", file=sys.stderr)
 
-    xsessionrc_dirs = env_directory_refs(xsessionrc_env)
+    current_path = shell_env.get("PATH", os.environ.get("PATH", BASE_PATH))
+    container_path = image_env(args.image).get("PATH", BASE_PATH)
+    forwarded_path = merge_path_values(current_path, container_path)
+    directory_env_map = dict(shell_env)
+    directory_env_map["PATH"] = current_path
+    forwarded_dirs = env_directory_refs(directory_env_map)
     ca_env, ca_mount_paths = host_ca_setup()
-    launch_env = os.environ.copy()
-    launch_env.update(xsessionrc_env)
+    launch_env = dict(shell_env)
     launch_env.update(ca_env)
     launch_env["HOME"] = str(home_dir)
     launch_env["PWD"] = str(cwd)
-    for key in ("TERM", "COLORTERM"):
-        value = os.environ.get(key)
-        if value:
-            launch_env[key] = value
+    launch_env["PATH"] = forwarded_path
+    launch_env["BASH_ENV"] = PROFILE_SCRIPT_CONTAINER_PATH
 
     env_names = ordered_unique(
         [
             "HOME",
             "PWD",
-            "TERM",
-            "COLORTERM",
-            *xsessionrc_env.keys(),
+            "BASH_ENV",
+            *shell_env.keys(),
             *ca_env.keys(),
         ]
     )
@@ -366,50 +407,61 @@ def main() -> None:
             (str(cwd), "rw"),
             (str(codex_dir), "rw"),
             *((path, "rw") for path in existing_roots),
-            *((path, "ro") for path in xsessionrc_dirs),
+            *((path, "ro") for path in forwarded_dirs),
             *((path, "ro") for path in ca_mount_paths),
         ]
     )
-    docker_cmd: list[str] = [
-        "docker",
-        "run",
-        "--rm",
-        "--init",
-        *docker_tty_flags(),
-        "--user",
-        f"{os.getuid()}:{os.getgid()}",
-        *docker_env_flags(env_names),
-        "--workdir",
-        str(cwd),
-    ]
-    for path, mode in mount_specs:
-        mount_spec = f"{path}:{path}"
-        if mode == "ro":
-            mount_spec = f"{mount_spec}:ro"
-        docker_cmd.extend(["-v", mount_spec])
+    with tempfile.TemporaryDirectory(prefix="codex-docker-") as temp_dir:
+        path_profile = Path(temp_dir) / "codex-forwarded-path.sh"
+        write_path_profile(path_profile, current_path)
 
-    docker_cmd.append(args.image)
-    docker_cmd.extend(
-        [
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-C",
+        docker_cmd: list[str] = [
+            "docker",
+            "run",
+            "--rm",
+            "--init",
+            "--network",
+            "host",
+            *docker_tty_flags(),
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            *docker_env_flags(env_names),
+            "--workdir",
             str(cwd),
         ]
-    )
-    for root in ordered_unique(existing_roots):
-        if root == str(cwd):
-            continue
-        docker_cmd.extend(["--add-dir", root])
-    docker_cmd.extend(args.codex_args)
+        for path, mode in mount_specs:
+            mount_spec = f"{path}:{path}"
+            if mode == "ro":
+                mount_spec = f"{mount_spec}:ro"
+            docker_cmd.extend(["-v", mount_spec])
+        docker_cmd.extend(
+            [
+                "-v",
+                f"{path_profile}:{PROFILE_SCRIPT_CONTAINER_PATH}:ro",
+            ]
+        )
 
-    if args.print_command or args.dry_run:
-        print(shlex.join(docker_cmd))
+        docker_cmd.append(args.image)
+        docker_cmd.extend(
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                str(cwd),
+            ]
+        )
+        for root in ordered_unique(existing_roots):
+            if root == str(cwd):
+                continue
+            docker_cmd.extend(["--add-dir", root])
+        docker_cmd.extend(args.codex_args)
 
-    if args.dry_run:
-        return
+        if args.print_command or args.dry_run:
+            print(shlex.join(docker_cmd))
 
-    ensure_image(script_dir, args.image, args.rebuild, args.skip_build)
-    run_checked(docker_cmd, env=launch_env)
+        if args.dry_run:
+            return
+
+        run_checked(docker_cmd, env=launch_env)
 
 
 if __name__ == "__main__":
