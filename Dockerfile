@@ -7,8 +7,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
+        build-essential \
         ca-certificates \
+        curl \
+        gh \
         git \
+        jq \
         less \
         openssh-client \
         python-is-python3 \
