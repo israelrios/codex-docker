@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 BASE_PATH_SEGMENTS = set(BASE_PATH.split(":"))
 EXCLUDED_MOUNT_PREFIXES = ("/usr", "/var")
 PROFILE_SCRIPT_CONTAINER_PATH = "/etc/profile.d/codex-forwarded-path.sh"
+DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +54,14 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Print the generated docker command and exit without running it.",
+    )
+    parser.add_argument(
+        "--docker",
+        action="store_true",
+        help=(
+            "Enable Docker integration by bind-mounting the host Docker socket "
+            "and adding the matching supplemental group when possible."
+        ),
     )
     parser.add_argument(
         "codex_args",
@@ -310,6 +320,38 @@ def host_ca_setup() -> tuple[dict[str, str], list[str]]:
     return env_updates, ordered_unique(mount_paths)
 
 
+def docker_socket_path(env_map: dict[str, str]) -> str | None:
+    docker_host = env_map.get("DOCKER_HOST", "")
+    if docker_host.startswith("unix://"):
+        socket_path = docker_host.removeprefix("unix://")
+        if socket_path and Path(socket_path).exists():
+            return socket_path
+        return None
+    if docker_host:
+        return None
+    if Path(DEFAULT_DOCKER_SOCKET).exists():
+        return DEFAULT_DOCKER_SOCKET
+    return None
+
+
+def docker_group_flags(socket_path: str | None) -> list[str]:
+    if not socket_path:
+        return []
+
+    try:
+        socket_stat = os.stat(socket_path)
+    except OSError:
+        return []
+
+    if not stat.S_ISSOCK(socket_stat.st_mode):
+        return []
+
+    socket_gid = socket_stat.st_gid
+    if socket_gid == os.getgid() or socket_gid not in os.getgroups():
+        return []
+    return ["--group-add", str(socket_gid)]
+
+
 def is_same_or_parent(parent: str, child: str) -> bool:
     try:
         Path(child).relative_to(parent)
@@ -386,6 +428,7 @@ def main() -> None:
     directory_env_map["PATH"] = current_path
     forwarded_dirs = env_directory_refs(directory_env_map)
     ca_env, ca_mount_paths = host_ca_setup()
+    docker_socket = docker_socket_path(shell_env) if args.docker else None
     launch_env = dict(shell_env)
     launch_env.update(ca_env)
     launch_env["HOME"] = str(home_dir)
@@ -409,6 +452,7 @@ def main() -> None:
             *((path, "rw") for path in existing_roots),
             *((path, "ro") for path in forwarded_dirs),
             *((path, "ro") for path in ca_mount_paths),
+            *([(docker_socket, "rw")] if docker_socket else []),
         ]
     )
     with tempfile.TemporaryDirectory(prefix="codex-docker-") as temp_dir:
@@ -425,6 +469,7 @@ def main() -> None:
             *docker_tty_flags(),
             "--user",
             f"{os.getuid()}:{os.getgid()}",
+            *docker_group_flags(docker_socket),
             *docker_env_flags(env_names),
             "--workdir",
             str(cwd),

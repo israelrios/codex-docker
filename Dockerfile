@@ -10,6 +10,7 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         curl \
+        docker.io \
         gh \
         git \
         jq \

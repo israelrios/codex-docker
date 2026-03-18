@@ -4,6 +4,7 @@
 
 ## Behavior
 
+- Installs the Docker CLI in the image.
 - Uses the current shell `PWD` as the container working directory.
 - Maps the current directory into the container at the same absolute path.
 - Maps `~/.codex` into the container at the same absolute path.
@@ -12,6 +13,8 @@
 - Forwards the invoking shell's current `PATH` and prepends it to the image `PATH`.
 - Maps directory paths referenced by those forwarded variables when they exist on the host, excluding paths under `/usr` and `/var`.
 - Reuses the host CA trust store by bind-mounting the host certificate paths read-only.
+- Leaves host Docker integration disabled by default.
+- `--docker` bind-mounts the host Docker socket into the container when available and adds the socket group when needed so the in-container Docker CLI can talk to the host daemon.
 - Uses Docker host network mode.
 - Runs the container with the invoking user UID and GID.
 - Starts `codex --dangerously-bypass-approvals-and-sandbox` automatically.
@@ -30,6 +33,12 @@ Forward extra Codex CLI arguments:
 
 ```bash
 ./codex-docker -- --model gpt-5.4 --search
+```
+
+Enable host Docker access inside the container:
+
+```bash
+./codex-docker --docker
 ```
 
 Print the generated Docker command:
