@@ -18,6 +18,7 @@ RUN apt-get update \
         openssh-client \
         python-is-python3 \
         python3 \
+        python3-pip \
         procps \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
