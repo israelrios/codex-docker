@@ -56,6 +56,7 @@ class EnvMountCandidateDraft:
 class HostPodmanStore:
     graph_driver_name: str
     graph_root: str
+    image_store: str
 
 
 @dataclass
@@ -597,9 +598,29 @@ def host_podman_store(podman_info: dict[str, object]) -> HostPodmanStore | None:
     if not graph_driver_name or not graph_root:
         return None
 
+    image_store = graph_root
+    graph_options = store.get("graphOptions")
+    if isinstance(graph_options, dict):
+        try:
+            option_map = require_string_key_dict(
+                graph_options,
+                "Podman graph options",
+            )
+        except ValueError:
+            option_map = {}
+        for key in (f"{graph_driver_name}.imagestore", "imagestore"):
+            candidate = option_map.get(key)
+            if not isinstance(candidate, str):
+                continue
+            candidate = candidate.strip()
+            if candidate:
+                image_store = candidate
+                break
+
     return HostPodmanStore(
         graph_driver_name=graph_driver_name,
         graph_root=graph_root,
+        image_store=image_store,
     )
 
 
@@ -618,17 +639,17 @@ def host_podman_additional_image_store(
     if store is None or store.graph_driver_name != "overlay":
         return None
 
-    graph_root = Path(store.graph_root).expanduser()
-    if not graph_root.is_absolute() or not graph_root.is_dir():
+    image_store = Path(store.image_store).expanduser()
+    if not image_store.is_absolute() or not image_store.is_dir():
         return None
 
     try:
-        if graph_root.resolve() == home_dir.resolve():
+        if image_store.resolve() == home_dir.resolve():
             return None
     except OSError:
         return None
 
-    return str(graph_root)
+    return str(image_store)
 
 
 def host_podman_mount_paths(home_dir: Path) -> list[str]:
