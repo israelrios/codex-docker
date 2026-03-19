@@ -26,7 +26,11 @@ RUN apt-get update \
         python3-pytest \
         procps \
         ripgrep \
+        uidmap \
     && rm -rf /var/lib/apt/lists/*
+
+RUN printf 'root:1:65536\n' >> /etc/subuid \
+    && printf 'root:1:65536\n' >> /etc/subgid
 
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \

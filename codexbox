@@ -717,6 +717,15 @@ def main() -> None:
     forwarded_env["PWD"] = str(cwd)
     forwarded_env["PATH"] = forwarded_path
     forwarded_env["BASH_ENV"] = PROFILE_SCRIPT_CONTAINER_PATH
+    # The container runs as root. Keep USER/LOGNAME aligned with the actual
+    # in-container identity so nested rootless Podman resolves subuid/subgid
+    # entries for root instead of a forwarded host username.
+    forwarded_env["USER"] = "root"
+    forwarded_env["LOGNAME"] = "root"
+    # Nested rootless Podman cannot reliably mount proc through the OCI
+    # runtime in this container, so prefer chroot isolation for build steps
+    # unless the caller explicitly chose another mode.
+    forwarded_env.setdefault("BUILDAH_ISOLATION", "chroot")
     base_mount_specs = merge_mount_specs(
         [
             (str(cwd), "rw"),

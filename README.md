@@ -6,6 +6,7 @@
 
 - Uses the local `podman` CLI to build and run the container.
 - Installs `podman` and `podman-docker` in the image, so both `podman` and Docker-compatible `docker` commands are available inside the container.
+- Installs `uidmap` and configures `/etc/subuid` and `/etc/subgid` for `root` inside the image so nested rootless Podman can unpack multi-user images instead of falling back to a single UID/GID mapping.
 - Installs `gh` and `glab` in the image for GitHub and GitLab CLI workflows.
 - Installs Python 3, `pip`, `pytest`, and `basedpyright` in the image.
 - Uses the current shell `PWD` as the container working directory.
@@ -25,7 +26,9 @@
 - Uses Podman host network mode.
 - Requires rootless Podman on the host.
 - Runs as `root` inside the container while bind-mounted files are still written as the invoking host user.
+- Normalizes `USER` and `LOGNAME` to `root` inside the container so nested rootless Podman resolves `/etc/subuid` and `/etc/subgid` for the actual in-container user instead of a forwarded host username.
 - Uses a generated nested Podman `storage.conf` that prefers `overlay` with `fuse-overlayfs` when `/dev/fuse` and the binary are available, and otherwise falls back to `vfs` to avoid overlay-on-overlay startup failures from host Podman storage settings.
+- Exports `BUILDAH_ISOLATION=chroot` by default inside the container so nested `podman build` `RUN` steps work without extra outer-container privileges. If you already set `BUILDAH_ISOLATION` in your shell, that value is preserved.
 - Starts `codex --dangerously-bypass-approvals-and-sandbox` automatically.
 
 Missing writable roots are skipped so a stale path in `config.toml` does not break the launcher.
