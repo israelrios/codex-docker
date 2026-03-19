@@ -28,6 +28,7 @@ FUSE_DEVICE_PATH = "/dev/fuse"
 FUSE_OVERLAYFS_PATH = "/usr/bin/fuse-overlayfs"
 APPROVALS_CONFIG_FILE = ".codexbox-conf.json"
 PODMAN_AUTO_MOUNT_RELATIVE_DIRS = (
+    ".cache/containers",
     ".local/share/containers",
     ".config/containers",
 )

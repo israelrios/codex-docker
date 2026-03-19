@@ -15,7 +15,7 @@
 - Maps `~/.gitconfig` into the container read-only when it exists on the host.
 - Maps `~/.config/gh` into the container read-only when it exists on the host.
 - Maps `~/.config/glab-cli` into the container read-only when it exists on the host.
-- Maps `~/.local/share/containers` and `~/.config/containers` into the container when those directories exist on the host.
+- Maps `~/.cache/containers`, `~/.local/share/containers`, and `~/.config/containers` into the container when those directories exist on the host.
 - Maps each existing path listed in `sandbox_workspace_write.writable_roots` from `~/.codex/config.toml`.
 - Forwards the invoking shell environment into the container, excluding keys matched by `vars-to-ignore.txt`.
 - Forwards the invoking shell's current `PATH` and prepends it to the image `PATH`.
