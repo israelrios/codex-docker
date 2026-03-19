@@ -19,6 +19,7 @@ RUN apt-get update \
         python-is-python3 \
         python3 \
         python3-pip \
+        python3-pytest \
         procps \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
