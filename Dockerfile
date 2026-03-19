@@ -10,12 +10,13 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         curl \
-        docker.io \
         gh \
         git \
         jq \
         less \
         openssh-client \
+        podman \
+        podman-docker \
         python-is-python3 \
         python3 \
         python3-pip \

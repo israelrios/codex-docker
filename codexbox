@@ -17,13 +17,17 @@ from pathlib import Path
 from typing import cast
 
 
-DEFAULT_IMAGE = "codex-docker:latest"
+CONTAINER_RUNTIME = "podman"
+DEFAULT_IMAGE = "codexbox:latest"
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 BASE_PATH_SEGMENTS = set(BASE_PATH.split(":"))
 EXCLUDED_MOUNT_PREFIXES = ("/usr", "/var")
 PROFILE_SCRIPT_CONTAINER_PATH = "/etc/profile.d/codex-forwarded-path.sh"
-DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock"
-APPROVALS_CONFIG_FILE = ".codex-docker-conf.json"
+APPROVALS_CONFIG_FILE = ".codexbox-conf.json"
+PODMAN_AUTO_MOUNT_RELATIVE_DIRS = (
+    ".local/share/containers",
+    ".config/containers",
+)
 
 
 @dataclass(frozen=True)
@@ -48,49 +52,40 @@ class ParsedArgs(argparse.Namespace):
     skip_build: bool = False
     print_command: bool = False
     dry_run: bool = False
-    docker: bool = False
     codex_args: list[str] = field(default_factory=list)
 
 
 def parse_args() -> ParsedArgs:
     parser = argparse.ArgumentParser(
         description=(
-            "Start a temporary Docker container in the current shell directory "
+            "Start a temporary Podman container in the current shell directory "
             "and launch Codex in yolo mode."
         )
     )
     _ = parser.add_argument(
         "--image",
         default=DEFAULT_IMAGE,
-        help=f"Docker image to run or build (default: {DEFAULT_IMAGE})",
+        help=f"Podman image to run or build (default: {DEFAULT_IMAGE})",
     )
     _ = parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="Force a rebuild of the Docker image before launching.",
+        help="Force a rebuild of the Podman image before launching.",
     )
     _ = parser.add_argument(
         "--skip-build",
         action="store_true",
-        help="Do not build the Docker image automatically if it is missing.",
+        help="Do not build the Podman image automatically if it is missing.",
     )
     _ = parser.add_argument(
         "--print-command",
         action="store_true",
-        help="Print the generated docker command before executing it.",
+        help="Print the generated podman command before executing it.",
     )
     _ = parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the generated docker command and exit without running it.",
-    )
-    _ = parser.add_argument(
-        "--docker",
-        action="store_true",
-        help=(
-            "Enable Docker integration by bind-mounting the host Docker socket "
-            "and adding the matching supplemental group when possible."
-        ),
+        help="Print the generated podman command and exit without running it.",
     )
     _ = parser.add_argument(
         "codex_args",
@@ -245,7 +240,7 @@ def shell_pwd() -> Path:
     return Path.cwd()
 
 
-def docker_tty_flags() -> list[str]:
+def container_tty_flags() -> list[str]:
     flags: list[str] = []
     if not sys.stdin.closed:
         flags.append("-i")
@@ -254,19 +249,53 @@ def docker_tty_flags() -> list[str]:
     return flags
 
 
-def docker_env_flags(names: Iterable[str]) -> list[str]:
+def container_env_flags(env_map: dict[str, str]) -> list[str]:
     flags: list[str] = []
-    for name in ordered_unique(names):
-        flags.extend(["--env", name])
+    for name in ordered_unique(env_map):
+        flags.extend(["--env", f"{name}={env_map[name]}"])
     return flags
 
 
-def image_env(image: str) -> dict[str, str]:
+def podman_runtime_env() -> dict[str, str]:
+    env_map = dict(os.environ)
+    env_map.pop("CONTAINER_CONNECTION", None)
+    env_map.pop("CONTAINER_HOST", None)
+    # Rootless Podman maps container root back to the invoking host user by default.
+    env_map["PODMAN_USERNS"] = ""
+    return env_map
+
+
+def ensure_rootless_podman(runtime_env: dict[str, str]) -> None:
+    try:
+        completed = subprocess.run(
+            [CONTAINER_RUNTIME, "info", "--format", "{{.Host.Security.Rootless}}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=runtime_env,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Missing container runtime: {CONTAINER_RUNTIME}") from exc
+
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or f"Unable to query {CONTAINER_RUNTIME} info."
+        raise SystemExit(message)
+
+    if completed.stdout.strip().lower() != "true":
+        raise SystemExit(
+            "This launcher requires rootless Podman so container root maps back "
+            "to the invoking host user."
+        )
+
+
+def image_env(image: str, runtime_env: dict[str, str]) -> dict[str, str]:
     completed = subprocess.run(
-        ["docker", "image", "inspect", image, "--format", "{{json .Config.Env}}"],
+        [CONTAINER_RUNTIME, "image", "inspect", image, "--format", "{{json .Config.Env}}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        env=runtime_env,
         check=False,
     )
     if completed.returncode != 0:
@@ -291,20 +320,27 @@ def image_env(image: str) -> dict[str, str]:
     return result
 
 
-def ensure_image(script_dir: Path, image: str, rebuild: bool, skip_build: bool) -> None:
+def ensure_image(
+    script_dir: Path,
+    image: str,
+    rebuild: bool,
+    skip_build: bool,
+    runtime_env: dict[str, str],
+) -> None:
     inspect = subprocess.run(
-        ["docker", "image", "inspect", image],
+        [CONTAINER_RUNTIME, "image", "inspect", image],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=runtime_env,
         check=False,
     )
     if inspect.returncode == 0 and not rebuild:
         return
     if skip_build:
-        raise SystemExit(f"Docker image {image!r} was not found and --skip-build was used.")
+        raise SystemExit(f"Podman image {image!r} was not found and --skip-build was used.")
 
-    build_cmd = ["docker", "build", "--pull", "--tag", image, str(script_dir)]
-    run_checked(build_cmd)
+    build_cmd = [CONTAINER_RUNTIME, "build", "--pull", "--tag", image, str(script_dir)]
+    run_checked(build_cmd, env=runtime_env)
 
 
 def run_checked(command: list[str], env: dict[str, str] | None = None) -> None:
@@ -426,36 +462,14 @@ def host_ca_setup() -> tuple[dict[str, str], list[str]]:
     return env_updates, ordered_unique(mount_paths)
 
 
-def docker_socket_path(env_map: dict[str, str]) -> str | None:
-    docker_host = env_map.get("DOCKER_HOST", "")
-    if docker_host.startswith("unix://"):
-        socket_path = docker_host.removeprefix("unix://")
-        if socket_path and Path(socket_path).exists():
-            return socket_path
-        return None
-    if docker_host:
-        return None
-    if Path(DEFAULT_DOCKER_SOCKET).exists():
-        return DEFAULT_DOCKER_SOCKET
-    return None
-
-
-def docker_group_flags(socket_path: str | None) -> list[str]:
-    if not socket_path:
-        return []
-
-    try:
-        socket_stat = os.stat(socket_path)
-    except OSError:
-        return []
-
-    if not stat.S_ISSOCK(socket_stat.st_mode):
-        return []
-
-    socket_gid = socket_stat.st_gid
-    if socket_gid == os.getgid() or socket_gid not in os.getgroups():
-        return []
-    return ["--group-add", str(socket_gid)]
+def host_podman_mount_paths(home_dir: Path) -> list[str]:
+    return ordered_unique(
+        [
+            str(path)
+            for path in (home_dir / rel_path for rel_path in PODMAN_AUTO_MOUNT_RELATIVE_DIRS)
+            if path.is_dir()
+        ]
+    )
 
 
 def is_same_or_parent(parent: str, child: str) -> bool:
@@ -584,8 +598,17 @@ def main() -> None:
     if not codex_dir.is_dir():
         raise SystemExit(f"Missing Codex directory: {codex_dir}")
 
+    runtime_env = podman_runtime_env()
+    ensure_rootless_podman(runtime_env)
+
     if not args.dry_run:
-        ensure_image(script_dir, args.image, args.rebuild, args.skip_build)
+        ensure_image(
+            script_dir,
+            args.image,
+            args.rebuild,
+            args.skip_build,
+            runtime_env,
+        )
 
     shell_env = filtered_shell_env(ignore_path)
     writable_roots = parse_writable_roots(config_path)
@@ -597,36 +620,26 @@ def main() -> None:
     existing_roots = ordered_unique(existing_roots)
 
     current_path = shell_env.get("PATH", os.environ.get("PATH", BASE_PATH))
-    container_path = image_env(args.image).get("PATH", BASE_PATH)
+    container_path = image_env(args.image, runtime_env).get("PATH", BASE_PATH)
     forwarded_path = merge_path_values(current_path, container_path)
     directory_env_map = dict(shell_env)
     directory_env_map["PATH"] = current_path
     env_candidates = env_mount_candidates(directory_env_map)
     ca_env, ca_mount_paths = host_ca_setup()
-    docker_socket = docker_socket_path(shell_env) if args.docker else None
-    launch_env = dict(shell_env)
-    launch_env.update(ca_env)
-    launch_env["HOME"] = str(home_dir)
-    launch_env["PWD"] = str(cwd)
-    launch_env["PATH"] = forwarded_path
-    launch_env["BASH_ENV"] = PROFILE_SCRIPT_CONTAINER_PATH
-
-    env_names = ordered_unique(
-        [
-            "HOME",
-            "PWD",
-            "BASH_ENV",
-            *shell_env.keys(),
-            *ca_env.keys(),
-        ]
-    )
+    podman_mount_paths = host_podman_mount_paths(home_dir)
+    forwarded_env = dict(shell_env)
+    forwarded_env.update(ca_env)
+    forwarded_env["HOME"] = str(home_dir)
+    forwarded_env["PWD"] = str(cwd)
+    forwarded_env["PATH"] = forwarded_path
+    forwarded_env["BASH_ENV"] = PROFILE_SCRIPT_CONTAINER_PATH
     base_mount_specs = merge_mount_specs(
         [
             (str(cwd), "rw"),
             (str(codex_dir), "rw"),
             *((path, "rw") for path in existing_roots),
+            *((path, "rw") for path in podman_mount_paths),
             *((path, "ro") for path in ca_mount_paths),
-            *([(docker_socket, "rw")] if docker_socket else []),
         ]
     )
     saved_approvals = load_env_mount_approvals(approvals_path)
@@ -674,22 +687,19 @@ def main() -> None:
             *((path, "ro") for path in sorted(newly_approved_paths)),
         ]
     )
-    with tempfile.TemporaryDirectory(prefix="codex-docker-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="codexbox-") as temp_dir:
         path_profile = Path(temp_dir) / "codex-forwarded-path.sh"
         write_path_profile(path_profile, current_path)
 
-        docker_cmd: list[str] = [
-            "docker",
+        container_cmd: list[str] = [
+            CONTAINER_RUNTIME,
             "run",
             "--rm",
             "--init",
             "--network",
             "host",
-            *docker_tty_flags(),
-            "--user",
-            f"{os.getuid()}:{os.getgid()}",
-            *docker_group_flags(docker_socket),
-            *docker_env_flags(env_names),
+            *container_tty_flags(),
+            *container_env_flags(forwarded_env),
             "--workdir",
             str(cwd),
         ]
@@ -697,16 +707,16 @@ def main() -> None:
             mount_spec = f"{path}:{path}"
             if mode == "ro":
                 mount_spec = f"{mount_spec}:ro"
-            docker_cmd.extend(["-v", mount_spec])
-        docker_cmd.extend(
+            container_cmd.extend(["-v", mount_spec])
+        container_cmd.extend(
             [
                 "-v",
                 f"{path_profile}:{PROFILE_SCRIPT_CONTAINER_PATH}:ro",
             ]
         )
 
-        docker_cmd.append(args.image)
-        docker_cmd.extend(
+        container_cmd.append(args.image)
+        container_cmd.extend(
             [
                 "--dangerously-bypass-approvals-and-sandbox",
                 "-C",
@@ -716,16 +726,16 @@ def main() -> None:
         for root in ordered_unique(existing_roots):
             if root == str(cwd):
                 continue
-            docker_cmd.extend(["--add-dir", root])
-        docker_cmd.extend(args.codex_args)
+            container_cmd.extend(["--add-dir", root])
+        container_cmd.extend(args.codex_args)
 
         if args.print_command or args.dry_run:
-            print(shlex.join(docker_cmd))
+            print(shlex.join(container_cmd))
 
         if args.dry_run:
             return
 
-        run_checked(docker_cmd, env=launch_env)
+        run_checked(container_cmd, env=runtime_env)
 
 
 def handle_keyboard_interrupt() -> None:
