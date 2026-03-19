@@ -11,8 +11,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import cast
 
 
 DEFAULT_IMAGE = "codex-docker:latest"
@@ -21,41 +23,68 @@ BASE_PATH_SEGMENTS = set(BASE_PATH.split(":"))
 EXCLUDED_MOUNT_PREFIXES = ("/usr", "/var")
 PROFILE_SCRIPT_CONTAINER_PATH = "/etc/profile.d/codex-forwarded-path.sh"
 DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock"
+APPROVALS_CONFIG_FILE = ".codex-docker-conf.json"
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(frozen=True)
+class EnvMountCandidate:
+    path: str
+    resolved_path: str
+    kind: str
+    env_vars: tuple[str, ...]
+
+
+@dataclass
+class EnvMountCandidateDraft:
+    resolved_path: str
+    kind: str
+    env_vars: list[str]
+
+
+@dataclass
+class ParsedArgs(argparse.Namespace):
+    image: str = DEFAULT_IMAGE
+    rebuild: bool = False
+    skip_build: bool = False
+    print_command: bool = False
+    dry_run: bool = False
+    docker: bool = False
+    codex_args: list[str] = field(default_factory=list)
+
+
+def parse_args() -> ParsedArgs:
     parser = argparse.ArgumentParser(
         description=(
             "Start a temporary Docker container in the current shell directory "
             "and launch Codex in yolo mode."
         )
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--image",
         default=DEFAULT_IMAGE,
         help=f"Docker image to run or build (default: {DEFAULT_IMAGE})",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--rebuild",
         action="store_true",
         help="Force a rebuild of the Docker image before launching.",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--skip-build",
         action="store_true",
         help="Do not build the Docker image automatically if it is missing.",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--print-command",
         action="store_true",
         help="Print the generated docker command before executing it.",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the generated docker command and exit without running it.",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--docker",
         action="store_true",
         help=(
@@ -63,15 +92,41 @@ def parse_args() -> argparse.Namespace:
             "and adding the matching supplemental group when possible."
         ),
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "codex_args",
         nargs=argparse.REMAINDER,
         help="Arguments forwarded to codex. Prefix them with -- if needed.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=ParsedArgs())
     if args.codex_args and args.codex_args[0] == "--":
         args.codex_args = args.codex_args[1:]
     return args
+
+
+def require_string_list(value: object, context: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"Expected {context} to be a list of strings")
+
+    raw_items = cast(list[object], value)
+    items: list[str] = []
+    for item in raw_items:
+        if not isinstance(item, str):
+            raise ValueError(f"Expected {context} to be a list of strings")
+        items.append(item)
+    return items
+
+
+def require_string_key_dict(value: object, context: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected {context} to be a JSON object")
+
+    raw_items = cast(dict[object, object], value)
+    result: dict[str, object] = {}
+    for key, item in raw_items.items():
+        if not isinstance(key, str):
+            raise ValueError(f"Expected {context} to contain only string keys")
+        result[key] = item
+    return result
 
 
 def parse_writable_roots(config_path: Path) -> list[str]:
@@ -109,8 +164,11 @@ def parse_writable_roots(config_path: Path) -> list[str]:
                 collecting = True
                 continue
             if value.startswith("[") and value.endswith("]"):
-                inline_items = ast.literal_eval(value)
-                return [str(item) for item in inline_items]
+                inline_items = cast(object, ast.literal_eval(value))
+                return require_string_list(
+                    inline_items,
+                    "writable_roots in ~/.codex/config.toml",
+                )
             raise ValueError(
                 "Unsupported writable_roots format in ~/.codex/config.toml"
             )
@@ -125,7 +183,10 @@ def parse_toml_string(value: str) -> str:
     value = value.strip()
     if not value:
         raise ValueError("Empty writable root entry in ~/.codex/config.toml")
-    return ast.literal_eval(value)
+    parsed_value = cast(object, ast.literal_eval(value))
+    if not isinstance(parsed_value, str):
+        raise ValueError("Writable root entry in ~/.codex/config.toml must be a string")
+    return parsed_value
 
 
 def ordered_unique(values: Iterable[str]) -> list[str]:
@@ -212,12 +273,17 @@ def image_env(image: str) -> dict[str, str]:
         return {}
 
     try:
-        env_entries = json.loads(completed.stdout.strip() or "[]")
+        env_entries = cast(object, json.loads(completed.stdout.strip() or "[]"))
     except json.JSONDecodeError:
         return {}
 
+    try:
+        entries = require_string_list(env_entries, "image environment entries")
+    except ValueError:
+        return {}
+
     result: dict[str, str] = {}
-    for entry in env_entries:
+    for entry in entries:
         if "=" not in entry:
             continue
         key, value = entry.split("=", 1)
@@ -259,17 +325,57 @@ def path_tokens(value: str) -> list[str]:
     return tokens
 
 
-def env_directory_refs(env_map: dict[str, str]) -> list[str]:
-    refs: list[str] = []
+def mountable_path_kind(path: Path) -> str | None:
+    try:
+        path_stat = path.stat()
+    except OSError:
+        return None
+
+    if stat.S_ISDIR(path_stat.st_mode):
+        return "directory"
+    if stat.S_ISREG(path_stat.st_mode):
+        return "file"
+    if stat.S_ISSOCK(path_stat.st_mode):
+        return "socket"
+    return None
+
+
+def env_mount_candidates(env_map: dict[str, str]) -> list[EnvMountCandidate]:
+    refs: dict[str, EnvMountCandidateDraft] = {}
     for key, value in env_map.items():
         for token in path_tokens(value):
             path = Path(token)
             path_str = str(path)
             if key == "PATH" and path_str in BASE_PATH_SEGMENTS:
                 continue
-            if path.is_dir() and not path_str.startswith(EXCLUDED_MOUNT_PREFIXES):
-                refs.append(str(path))
-    return ordered_unique(refs)
+            if path_str.startswith(EXCLUDED_MOUNT_PREFIXES):
+                continue
+
+            kind = mountable_path_kind(path)
+            if kind is None:
+                continue
+
+            resolved_path = str(path.resolve())
+            entry = refs.setdefault(
+                path_str,
+                EnvMountCandidateDraft(
+                    resolved_path=resolved_path,
+                    kind=kind,
+                    env_vars=[],
+                ),
+            )
+            if key not in entry.env_vars:
+                entry.env_vars.append(key)
+
+    return [
+        EnvMountCandidate(
+            path=path,
+            resolved_path=data.resolved_path,
+            kind=data.kind,
+            env_vars=tuple(data.env_vars),
+        )
+        for path, data in refs.items()
+    ]
 
 
 def write_path_profile(script_path: Path, forwarded_path: str) -> None:
@@ -286,7 +392,7 @@ def write_path_profile(script_path: Path, forwarded_path: str) -> None:
             ]
         )
     lines.extend(["export PATH", "unset _codex_path"])
-    script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _ = script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def host_ca_setup() -> tuple[dict[str, str], list[str]]:
@@ -354,10 +460,14 @@ def docker_group_flags(socket_path: str | None) -> list[str]:
 
 def is_same_or_parent(parent: str, child: str) -> bool:
     try:
-        Path(child).relative_to(parent)
+        _ = Path(child).relative_to(parent)
         return True
     except ValueError:
         return False
+
+
+def is_covered_by_mounts(path: str, specs: Iterable[tuple[str, str]]) -> bool:
+    return any(is_same_or_parent(existing_path, path) for existing_path, _ in specs)
 
 
 def merge_mount_specs(specs: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -382,12 +492,88 @@ def merge_mount_specs(specs: Iterable[tuple[str, str]]) -> list[tuple[str, str]]
     return ordered_specs
 
 
+def load_env_mount_approvals(approvals_path: Path) -> set[str]:
+    if not approvals_path.is_file():
+        return set()
+
+    try:
+        raw_data = cast(object, json.loads(approvals_path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid env mount approvals file {approvals_path}: {exc}") from exc
+
+    try:
+        data = require_string_key_dict(raw_data, f"env mount approvals file {approvals_path}")
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    try:
+        approved_paths = require_string_list(
+            data.get("approved_paths", []),
+            f"approved_paths in {approvals_path}",
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    return set(approved_paths)
+
+
+def save_env_mount_approvals(approvals_path: Path, approved_paths: Iterable[str]) -> None:
+    data = {
+        "approved_paths": ordered_unique(sorted(approved_paths)),
+    }
+    _ = approvals_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def confirm_env_mount_candidates(
+    approvals_path: Path, candidates: list[EnvMountCandidate]
+) -> set[str]:
+    if not candidates:
+        return set()
+
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        candidate_list = "\n".join(f"  - {candidate.path}" for candidate in candidates)
+        message = (
+            "Approval is required before bind-mounting env-var-derived paths.\n"
+            + f"Run the launcher interactively to approve these paths:\n{candidate_list}"
+        )
+        raise SystemExit(
+            message
+        )
+
+    print(
+        "Approval required for env-var-derived bind mounts.",
+        file=sys.stderr,
+    )
+    print(
+        f"Approved paths will be saved to {approvals_path}.",
+        file=sys.stderr,
+    )
+    for candidate in candidates:
+        env_vars = ", ".join(candidate.env_vars)
+        print(
+            f"  - {candidate.path} ({candidate.kind}; from {env_vars})",
+            file=sys.stderr,
+        )
+
+    response = input("Allow and remember these bind mounts? [y/N]: ").strip().lower()
+    if response not in {"y", "yes"}:
+        print("Skipping unapproved env-var-derived bind mounts.", file=sys.stderr)
+        return set()
+
+    approved_paths = {candidate.path for candidate in candidates}
+    approvals_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_approvals = load_env_mount_approvals(approvals_path)
+    save_env_mount_approvals(approvals_path, existing_approvals | approved_paths)
+    return approved_paths
+
+
 def main() -> None:
     args = parse_args()
     script_dir = Path(__file__).resolve().parent
     home_dir = Path.home()
     codex_dir = home_dir / ".codex"
     config_path = codex_dir / "config.toml"
+    approvals_path = home_dir / APPROVALS_CONFIG_FILE
     ignore_path = script_dir / "vars-to-ignore.txt"
     cwd = shell_pwd()
 
@@ -404,29 +590,18 @@ def main() -> None:
     shell_env = filtered_shell_env(ignore_path)
     writable_roots = parse_writable_roots(config_path)
     existing_roots: list[str] = []
-    missing_roots: list[str] = []
     for root in writable_roots:
         path = Path(os.path.expanduser(root))
         if path.is_dir():
             existing_roots.append(str(path))
-        else:
-            missing_roots.append(str(path))
     existing_roots = ordered_unique(existing_roots)
-
-    if missing_roots:
-        print(
-            "Warning: skipping missing writable_roots from ~/.codex/config.toml:",
-            file=sys.stderr,
-        )
-        for root in missing_roots:
-            print(f"  - {root}", file=sys.stderr)
 
     current_path = shell_env.get("PATH", os.environ.get("PATH", BASE_PATH))
     container_path = image_env(args.image).get("PATH", BASE_PATH)
     forwarded_path = merge_path_values(current_path, container_path)
     directory_env_map = dict(shell_env)
     directory_env_map["PATH"] = current_path
-    forwarded_dirs = env_directory_refs(directory_env_map)
+    env_candidates = env_mount_candidates(directory_env_map)
     ca_env, ca_mount_paths = host_ca_setup()
     docker_socket = docker_socket_path(shell_env) if args.docker else None
     launch_env = dict(shell_env)
@@ -445,14 +620,58 @@ def main() -> None:
             *ca_env.keys(),
         ]
     )
-    mount_specs = merge_mount_specs(
+    base_mount_specs = merge_mount_specs(
         [
             (str(cwd), "rw"),
             (str(codex_dir), "rw"),
             *((path, "rw") for path in existing_roots),
-            *((path, "ro") for path in forwarded_dirs),
             *((path, "ro") for path in ca_mount_paths),
             *([(docker_socket, "rw")] if docker_socket else []),
+        ]
+    )
+    saved_approvals = load_env_mount_approvals(approvals_path)
+    home_resolved = str(home_dir.resolve())
+    current_approved_specs = merge_mount_specs(
+        [
+            *base_mount_specs,
+            *(
+                (candidate.path, "ro")
+                for candidate in env_candidates
+                if candidate.path in saved_approvals and candidate.resolved_path != home_resolved
+            ),
+        ]
+    )
+    blocked_home_candidates: list[EnvMountCandidate] = []
+    pending_candidates: list[EnvMountCandidate] = []
+    approved_env_paths: list[str] = []
+
+    for candidate in env_candidates:
+        if is_covered_by_mounts(candidate.path, base_mount_specs):
+            continue
+        if candidate.resolved_path == home_resolved:
+            blocked_home_candidates.append(candidate)
+            continue
+        if is_covered_by_mounts(candidate.path, current_approved_specs):
+            if candidate.path in saved_approvals:
+                approved_env_paths.append(candidate.path)
+            continue
+        pending_candidates.append(candidate)
+
+    if blocked_home_candidates:
+        print(
+            "Skipping env-var-derived mounts of the home directory root:",
+            file=sys.stderr,
+        )
+        for candidate in blocked_home_candidates:
+            env_vars = ", ".join(candidate.env_vars)
+            print(f"  - {candidate.path} (from {env_vars})", file=sys.stderr)
+
+    newly_approved_paths = confirm_env_mount_candidates(approvals_path, pending_candidates)
+    mount_specs = merge_mount_specs(
+        [
+            *base_mount_specs,
+            *((path, "ro") for path in approved_env_paths),
+            *((path, "ro") for path in sorted(newly_approved_paths)),
         ]
     )
     with tempfile.TemporaryDirectory(prefix="codex-docker-") as temp_dir:
@@ -509,5 +728,13 @@ def main() -> None:
         run_checked(docker_cmd, env=launch_env)
 
 
+def handle_keyboard_interrupt() -> None:
+    print(file=sys.stderr)
+    raise SystemExit(130)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        handle_keyboard_interrupt()
